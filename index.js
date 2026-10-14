@@ -11,7 +11,7 @@ import { eventSource, event_types, saveSettingsDebounced, extension_prompts, ext
 import { extension_settings } from '../../../extensions.js';
 
 const KEY = 'cacheFriendly';
-const DEFAULTS = { enabled: true, depthToEnd: true, vectorsToEnd: true, claudeCache: true, cache1h: false, log: false };
+const DEFAULTS = { enabled: true, depthToEnd: true, vectorsToEnd: true, claudeCache: true, cache1h: false, checkup: true, checkupToast: true, log: false };
 
 // world_info_position: before 0, after 1, ANTop 2, ANBottom 3, atDepth 4, EMTop 5, EMBottom 6, outlet 7
 const STATIC_POSITIONS = [0, 1, 5, 6];
@@ -77,6 +77,92 @@ globalThis.cacheFriendly_interceptor = async function () {
     if (s.log && moved) console.log(`[Cache Friendly] moved ${moved} vector recall block(s) to the end`);
 };
 
+// ── 缓存体检 ─────────────────────────────────────────────────────
+// 每轮把要发出去的消息跟上一轮比：从开头起有多少字一模一样（= 理论上能命中缓存的部分）。
+// 掉下来时指出从哪儿开始变的，尽量认出是哪条世界书 / 角色卡哪一栏 / 向量召回。
+// 只在本地比，不发任何请求；只看文字，不看缓存标记。
+const CHECK = { chatId: null, prev: null, wiNow: [], wiPrev: [] };
+
+function msgText(m) {
+    if (!m) return '';
+    if (typeof m.content === 'string') return m.content;
+    if (Array.isArray(m.content)) return m.content.map(p => (p && typeof p.text === 'string') ? p.text : '').join('');
+    return '';
+}
+
+function onWorldInfoActivated(entries) {
+    CHECK.wiPrev = CHECK.wiNow;   // 上一轮亮过、这一轮灭了的条目，也要认得出来
+    CHECK.wiNow = Array.isArray(entries) ? entries.map(e => ({ name: e.comment || (Array.isArray(e.key) ? e.key.join(',') : '') || `#${e.uid}`, text: String(e.content || '') })) : [];
+}
+
+// 在 text 的第 pos 个字附近，认一认这是谁的内容
+function whoIsAt(text, pos) {
+    const covers = (needle) => {
+        if (!needle || needle.length < 8) return false;
+        const head = needle.slice(0, 60);
+        let i = text.indexOf(head);
+        while (i >= 0) {
+            if (pos >= i - 2 && pos <= i + needle.length + 2) return true;
+            i = text.indexOf(head, i + 1);
+        }
+        return false;
+    };
+    for (const e of [...CHECK.wiNow, ...CHECK.wiPrev]) if (covers(e.text)) return `世界书「${e.name}」`;
+    for (const key of VECTOR_KEYS) if (covers(String(extension_prompts[key]?.value || ''))) return '向量召回';
+    const ctx = SillyTavern.getContext();
+    const ch = ctx.characters?.[ctx.characterId];
+    if (ch) {
+        const f = { description: '角色描述', personality: '角色性格', scenario: '场景', mes_example: '对话示例' };
+        for (const k in f) if (covers(String(ch[k] || ''))) return `角色卡·${f[k]}`;
+    }
+    return '';
+}
+
+function snippet(t, pos) {
+    return t.slice(Math.max(0, pos - 6), pos + 24).replace(/\s+/g, ' ');
+}
+
+function runCheckup(chat) {
+    const s = settings();
+    if (!s.checkup) return;
+    const ctx = SillyTavern.getContext();
+    const chatId = ctx.getCurrentChatId?.() ?? null;
+    const now = chat.map(m => ({ role: m.role, text: msgText(m) }));
+    const prev = (CHECK.chatId === chatId) ? CHECK.prev : null;
+    CHECK.chatId = chatId; CHECK.prev = now;
+    if (!prev) { showCheckup('等下一轮再比（第一轮没东西可比）', null); return; }
+
+    const total = now.reduce((a, m) => a + m.text.length, 0) || 1;
+    let same = 0, k = 0, pos = 0;
+    for (; k < now.length && k < prev.length; k++) {
+        if (now[k].role === prev[k].role && now[k].text === prev[k].text) { same += now[k].text.length; continue; }
+        const a = prev[k].text, b = now[k].text;
+        if (now[k].role === prev[k].role) { while (pos < a.length && pos < b.length && a[pos] === b[pos]) pos++; }
+        same += pos;
+        break;
+    }
+    const pct = Math.round(100 * same / total);
+    const tail = now.length - k;   // 变化点后面还剩几条
+    let where = '';
+    if (k < now.length) {
+        const who = whoIsAt(now[k].text, pos) || (k < prev.length ? whoIsAt(prev[k].text, pos) : '');
+        where = `从第 ${k + 1} 条（共 ${now.length} 条）开始变` + (who ? `，是 ${who}` : '') + `：「${snippet(now[k].text, pos)}」`;
+    }
+    const ok = pct >= 70 || tail <= 3;   // 只在最后两三条变 = 正常的新对话
+    showCheckup(`本轮前缀不变 ${pct}%` + (where ? `｜${where}` : ''), ok);
+    if (!ok && s.checkupToast && typeof toastr !== 'undefined') {
+        toastr.warning(`前面只有 ${pct}% 没变，缓存大半作废。<br>${where}`, '缓存体检', { escapeHtml: false, timeOut: 8000 });
+    }
+    if (s.log) console.log('[Cache Friendly] checkup', pct, where);
+}
+
+function showCheckup(text, ok) {
+    const el = document.getElementById('cf_checkup_text');
+    if (!el) return;
+    el.textContent = text;
+    el.style.color = ok === false ? 'var(--warning, #e0a040)' : '';
+}
+
 // ── 自动给 Claude 打缓存标记（自定义 / OpenAI 兼容接口） ─────────────────
 // 原版酒馆只在"Claude"接口来源、并且改了 config.yaml 时才打缓存标记。
 // 走"自定义（OpenAI 兼容）"连 Claude 模型时，消息会原样发给接口，
@@ -96,7 +182,9 @@ function markCache(message, ttl) {
 
 function onPromptReady(data) {
     const s = settings();
-    if (!s.claudeCache || !data || data.dryRun || !Array.isArray(data.chat)) return;
+    if (!data || data.dryRun || !Array.isArray(data.chat)) return;
+    try { runCheckup(data.chat); } catch (e) { console.warn('[Cache Friendly] checkup failed', e); }
+    if (!s.claudeCache) return;
     const ctx = SillyTavern.getContext();
     const oai = ctx.chatCompletionSettings || {};
     if (oai.chat_completion_source !== 'custom') return;            // Claude 原生接口归 config.yaml 管
@@ -143,6 +231,11 @@ function addSettingsUi() {
           <small>"自定义（OpenAI 兼容）"连 Claude 模型时，自动打缓存标记（system + 聊天记录滚动缓存）。接口要认这个标记才生效；用"Claude"接口的请改 config.yaml。</small>
           <label class="checkbox_label"><input id="cf_1h" type="checkbox"> 用 1 小时缓存</label>
           <small>写入贵一倍，适合聊得慢、经常隔十几分钟才回一句。</small>
+          <hr>
+          <label class="checkbox_label"><input id="cf_check" type="checkbox"> 缓存体检</label>
+          <small>每轮比一比：前面有多少跟上一轮一模一样（这部分才能吃到缓存）。</small>
+          <div id="cf_checkup_text" style="font-size:0.9em;margin:4px 0 6px;word-break:break-all;">还没发过消息</div>
+          <label class="checkbox_label"><input id="cf_check_toast" type="checkbox"> 掉到 70% 以下时弹提示，告诉我是哪儿变了</label>
           <label class="checkbox_label"><input id="cf_log" type="checkbox"> 在浏览器控制台打印挪了几条</label>
         </div>
       </div>
@@ -153,6 +246,8 @@ function addSettingsUi() {
     $('#cf_vec').prop('checked', s.vectorsToEnd).on('input', function () { settings().vectorsToEnd = !!$(this).prop('checked'); saveSettingsDebounced(); });
     $('#cf_claude').prop('checked', s.claudeCache).on('input', function () { settings().claudeCache = !!$(this).prop('checked'); saveSettingsDebounced(); });
     $('#cf_1h').prop('checked', s.cache1h).on('input', function () { settings().cache1h = !!$(this).prop('checked'); saveSettingsDebounced(); });
+    $('#cf_check').prop('checked', s.checkup).on('input', function () { settings().checkup = !!$(this).prop('checked'); saveSettingsDebounced(); });
+    $('#cf_check_toast').prop('checked', s.checkupToast).on('input', function () { settings().checkupToast = !!$(this).prop('checked'); saveSettingsDebounced(); });
     $('#cf_log').prop('checked', s.log).on('input', function () { settings().log = !!$(this).prop('checked'); saveSettingsDebounced(); });
 }
 
@@ -161,4 +256,5 @@ jQuery(() => {
     addSettingsUi();
     eventSource.on(event_types.WORLDINFO_ENTRIES_LOADED, onEntriesLoaded);
     eventSource.on(event_types.CHAT_COMPLETION_PROMPT_READY, onPromptReady);
+    eventSource.on(event_types.WORLD_INFO_ACTIVATED, onWorldInfoActivated);
 });
