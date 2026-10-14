@@ -1,0 +1,12 @@
+{
+    "display_name": "Cache Friendly (缓存友好)",
+    "loading_order": 1000,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "",
+    "author": "大白 & 银狐",
+    "version": "1.2.0",
+    "homePage": "https://github.com/kmiumiukaltine-maker/SillyTavern-CacheFriendly",
+    "generate_interceptor": "cacheFriendly_interceptor"
+}
