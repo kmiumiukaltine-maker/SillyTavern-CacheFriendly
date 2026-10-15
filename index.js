@@ -90,6 +90,7 @@ function onEntriesLoaded(lore) {
             }
         }
     }
+    STAT.moved = moved; STAT.flattened = flattened;
     if (s.log) console.log(`[Cache Friendly] moved ${moved} entries to the end, flattened ${flattened} @depth entries`);
 }
 
@@ -113,6 +114,7 @@ globalThis.cacheFriendly_interceptor = async function () {
         p.depth = 0;
         moved++;
     }
+    STAT.vectors = moved;
     if (s.log && moved) console.log(`[Cache Friendly] moved ${moved} vector recall block(s) to the end`);
 };
 
@@ -120,7 +122,8 @@ globalThis.cacheFriendly_interceptor = async function () {
 // 每轮把要发出去的消息跟上一轮比：从开头起有多少字一模一样（= 理论上能命中缓存的部分）。
 // 掉下来时指出从哪儿开始变的，尽量认出是哪条世界书 / 角色卡哪一栏 / 向量召回。
 // 只在本地比，不发任何请求；只看文字，不看缓存标记。
-const CHECK = { chatId: null, prev: null, wiNow: [], wiPrev: [] };
+const CHECK = { chatId: null, prev: null, wiNow: [], wiPrev: [], history: [] };
+const STAT = { moved: 0, flattened: 0, vectors: 0 };   // 最近一轮挪了多少，给测试报告用
 
 function msgText(m) {
     if (!m) return '';
@@ -181,7 +184,7 @@ function runCheckup(chat) {
     const now = chat.map(m => ({ role: m.role, text: msgText(m) }));
     const prev = (CHECK.chatId === chatId) ? CHECK.prev : null;
     CHECK.chatId = chatId; CHECK.prev = now;
-    if (!prev) { showCheckup('等下一轮再比（第一轮没东西可比）', null); return; }
+    if (!prev) { CHECK.history = []; showCheckup('等下一轮再比（第一轮没东西可比）', null); return; }
 
     const total = now.reduce((a, m) => a + m.text.length, 0) || 1;
     let same = 0, k = 0, pos = 0;
@@ -198,15 +201,59 @@ function runCheckup(chat) {
     if (k < now.length) {
         CHECK.hitId = null;
         const who = whoIsAt(now[k].text, pos) || (k < prev.length ? whoIsAt(prev[k].text, pos) : '');
+        CHECK.lastWho = who;
         if (CHECK.hitId && tail > 3 && markVolatile(CHECK.hitId, '体检发现它在变')) where = '（已记下，下一轮起挪到末尾）';
         where = `从第 ${k + 1} 条（共 ${now.length} 条）开始变` + (who ? `，是 ${who}` : '') + `：「${snippet(now[k].text, pos)}」` + where;
     }
     const ok = pct >= 70 || tail <= 3;   // 只在最后两三条变 = 正常的新对话
+    CHECK.history.push({ pct, at: k < now.length ? k + 1 : null, n: now.length, who: k < now.length ? (CHECK.lastWho || '') : '', ok });
+    if (CHECK.history.length > 10) CHECK.history.shift();
     showCheckup(`本轮前缀不变 ${pct}%` + (where ? `｜${where}` : ''), ok);
     if (!ok && s.checkupToast && typeof toastr !== 'undefined') {
-        toastr.warning(`前面只有 ${pct}% 没变，缓存大半作废。<br>${where}`, '缓存体检', { escapeHtml: false, timeOut: 8000 });
+        toastr.warning(`前面只有 ${pct}% 没变，缓存大半作废。\n${where}`, '缓存体检', { timeOut: 8000 });
     }
     if (s.log) console.log('[Cache Friendly] checkup', pct, where);
+}
+
+// ── 测试报告 ─────────────────────────────────────────────────────
+// 一键生成一段纯文字，测试的人贴到群里就行。不含接口地址、钥匙、聊天内容；
+// 模型名前面 [xxx] 这种通道前缀也去掉。
+async function buildReport() {
+    const s = settings();
+    const ctx = SillyTavern.getContext();
+    const oai = ctx.chatCompletionSettings || {};
+    let ver = '?', st = '?';
+    try { ver = (await (await fetch(new URL('./manifest.json', import.meta.url))).json()).version; } catch { /* 拿不到就算了 */ }
+    try { st = (await (await fetch('/version')).json()).pkgVersion || '?'; } catch { /* 同上 */ }
+    const src = oai.chat_completion_source || '?';
+    const rawModel = String((src === 'custom' ? oai.custom_model : oai[`${src}_model`]) || oai.openai_model || '?');
+    const model = rawModel.replace(/^\s*\[[^\]]*\]\s*/, '');
+    const on = (b) => (b ? '开' : '关');
+    const vol = (volatileSet() || []).map(id => ENTRY.get(id)?.name || id);
+    const lines = [
+        '【Cache Friendly 测试报告】',
+        `插件 ${ver} ｜ 酒馆 ${st}`,
+        `接口来源：${src} ｜ 模型：${model}`,
+        `开关：挪世界书 ${on(s.enabled)}｜带变量一律挪 ${on(s.strictMacro)}｜深度条目收尾 ${on(s.depthToEnd)}｜向量召回 ${on(s.vectorsToEnd)}｜自动Claude缓存 ${on(s.claudeCache)}｜1小时 ${on(s.cache1h)}`,
+        `最近一轮：挪了 ${STAT.moved} 条世界书，收尾 ${STAT.flattened} 条深度条目，向量召回 ${STAT.vectors ? '已挪' : '无/未挪'}`,
+        `本聊天里检测到在变、已挪走的常驻条目：${vol.length ? vol.join('、') : '无'}`,
+        `最近 ${CHECK.history.length} 轮体检（前缀不变%）：`,
+        ...CHECK.history.map((h, i) => `  ${i + 1}. ${h.pct}%` + (h.at ? `，从第 ${h.at}/${h.n} 条开始变` : '') + (h.who ? `（${h.who}）` : '') + (h.ok ? '' : ' ⚠')),
+        '（请再附一张用量记录截图：缓存读取 / 写入，记得打码钥匙）',
+    ];
+    if (!CHECK.history.length) lines.splice(7, 0, '  还没有数据：先聊两三轮再生成');
+    return lines.join('\n');
+}
+
+async function copyReport() {
+    const text = await buildReport();
+    const box = document.getElementById('cf_report_box');
+    if (box) { box.value = text; box.style.display = 'block'; }
+    let ok = false;
+    try { await navigator.clipboard.writeText(text); ok = true; } catch {
+        try { box?.select(); ok = document.execCommand('copy'); } catch { /* 手动复制 */ }
+    }
+    if (typeof toastr !== 'undefined') toastr[ok ? 'success' : 'info'](ok ? '已复制，贴到群里就行' : '复制不了，请在下面的框里长按全选复制', '测试报告');
 }
 
 function showCheckup(text, ok) {
@@ -291,6 +338,8 @@ function addSettingsUi() {
           <small>每轮比一比：前面有多少跟上一轮一模一样（这部分才能吃到缓存）。</small>
           <div id="cf_checkup_text" style="font-size:0.9em;margin:4px 0 6px;word-break:break-all;">还没发过消息</div>
           <label class="checkbox_label"><input id="cf_check_toast" type="checkbox"> 掉到 70% 以下时弹提示，告诉我是哪儿变了</label>
+          <div id="cf_report" class="menu_button" style="margin:6px 0;width:fit-content;">📋 复制测试报告</div>
+          <textarea id="cf_report_box" class="text_pole" rows="8" readonly style="display:none;font-size:0.85em;"></textarea>
           <label class="checkbox_label"><input id="cf_log" type="checkbox"> 在浏览器控制台打印挪了几条</label>
         </div>
       </div>
@@ -304,6 +353,7 @@ function addSettingsUi() {
     $('#cf_1h').prop('checked', s.cache1h).on('input', function () { settings().cache1h = !!$(this).prop('checked'); saveSettingsDebounced(); });
     $('#cf_check').prop('checked', s.checkup).on('input', function () { settings().checkup = !!$(this).prop('checked'); saveSettingsDebounced(); });
     $('#cf_check_toast').prop('checked', s.checkupToast).on('input', function () { settings().checkupToast = !!$(this).prop('checked'); saveSettingsDebounced(); });
+    $('#cf_report').on('click', copyReport);
     $('#cf_log').prop('checked', s.log).on('input', function () { settings().log = !!$(this).prop('checked'); saveSettingsDebounced(); });
 }
 
