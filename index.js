@@ -4,14 +4,14 @@
 // 内容里有 {{getvar}} / {{random}} / {{time}} / <% %> 模板的）如果放在角色卡前后，
 // 每轮都会让后面整段聊天记录的缓存作废。
 // 这个插件在酒馆挑条目之前，把这些"会变的"条目改派到聊天最末尾（深度 0），
-// 不会变的常驻条目原地不动。只改本轮的临时副本，不会写回你的世界书文件。
+// 不会变的常驻条目原地不动；带变量的常驻条目要看到它真的变了才挪。只改本轮的临时副本，不会写回你的世界书文件。
 // 向量召回（聊天记录向量化 / 资料库）每轮捞的不同，也一并挪到末尾。
 
 import { eventSource, event_types, saveSettingsDebounced, extension_prompts, extension_prompt_types } from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
 
 const KEY = 'cacheFriendly';
-const DEFAULTS = { enabled: true, depthToEnd: true, vectorsToEnd: true, claudeCache: true, cache1h: false, checkup: true, checkupToast: true, log: false };
+const DEFAULTS = { enabled: true, strictMacro: false, depthToEnd: true, vectorsToEnd: true, claudeCache: true, cache1h: false, checkup: true, checkupToast: true, log: false };
 
 // world_info_position: before 0, after 1, ANTop 2, ANBottom 3, atDepth 4, EMTop 5, EMBottom 6, outlet 7
 const STATIC_POSITIONS = [0, 1, 5, 6];
@@ -25,21 +25,60 @@ function settings() {
     return extension_settings[KEY];
 }
 
-function isVolatile(entry) {
-    if (!entry.constant) return true;                      // 绿灯：这轮亮下轮灭
+// ── 判断哪些条目要挪 ───────────────────────────────────────────
+// 绿灯（非常驻）：这轮亮下轮灭，一律挪。
+// 带变量 / <% %> 的常驻条目：很多其实一整局都不变（开局设一次的世界观、名字……），
+//   所以先留在原位，插件每轮记下它实际发出去的内容；只有看到它前后两轮真的变了，
+//   才记成"会变的"，从下一轮起挪到末尾（记在这个聊天的元数据里，换聊天各算各的）。
+// 手动：条目标题里写 [cf:end] 一律挪，写 [cf:keep] 一律不挪。
+// 设置里勾"带变量的一律挪"就回到 1.3.0 以前的做法。
+const ENTRY = new Map();      // id -> { name, raw, constant, macro }
+const LAST = new Map();       // id -> 上一轮实际内容（只在内存里，刷新后重新记）
+
+function entryId(e) { return `${e.world}.${e.uid}`; }
+function hasMacro(text) { return VOLATILE.test(text) || text.includes('<%'); }
+
+function volatileSet() {
+    const ctx = SillyTavern.getContext();
+    const meta = ctx.chatMetadata;
+    if (!meta) return null;
+    if (!Array.isArray(meta.cacheFriendlyVolatile)) meta.cacheFriendlyVolatile = [];
+    return meta.cacheFriendlyVolatile;
+}
+
+function markVolatile(id, why) {
+    const info = ENTRY.get(id);
+    if (!info || !info.constant || !info.macro) return false;   // 只管"带变量的常驻条目"
+    const list = volatileSet();
+    if (!list || list.includes(id)) return false;
+    list.push(id);
+    SillyTavern.getContext().saveMetadataDebounced?.();
+    if (settings().log) console.log(`[Cache Friendly] 「${info.name}」${why}，下一轮起挪到末尾`);
+    return true;
+}
+
+function shouldMove(entry, s) {
+    const name = String(entry.comment || '');
+    if (name.includes('[cf:keep]')) return false;
+    if (name.includes('[cf:end]')) return true;
+    if (!entry.constant) return true;
     const text = String(entry.content ?? '');
-    return VOLATILE.test(text) || text.includes('<%');     // 内容会变的蓝灯
+    if (!hasMacro(text)) return false;
+    if (s.strictMacro) return true;
+    return (volatileSet() || []).includes(entryId(entry));
 }
 
 function onEntriesLoaded(lore) {
     const s = settings();
-    if (!s.enabled) return;
     let moved = 0, flattened = 0;
     for (const list of [lore.globalLore, lore.characterLore, lore.chatLore, lore.personaLore]) {
         if (!Array.isArray(list)) continue;
         for (const entry of list) {
             if (!entry || entry.disable) continue;
-            if (STATIC_POSITIONS.includes(Number(entry.position)) && isVolatile(entry)) {
+            const raw = String(entry.content ?? '');
+            ENTRY.set(entryId(entry), { name: entry.comment || (Array.isArray(entry.key) ? entry.key.join(',') : '') || `#${entry.uid}`, raw, constant: !!entry.constant, macro: hasMacro(raw) });
+            if (!s.enabled) continue;
+            if (STATIC_POSITIONS.includes(Number(entry.position)) && shouldMove(entry, s)) {
                 entry.position = AT_DEPTH;
                 entry.depth = 0;
                 entry.role = ROLE_SYSTEM;
@@ -51,7 +90,7 @@ function onEntriesLoaded(lore) {
             }
         }
     }
-    if (s.log) console.log(`[Cache Friendly] moved ${moved} volatile entries to the end, flattened ${flattened} @depth entries`);
+    if (s.log) console.log(`[Cache Friendly] moved ${moved} entries to the end, flattened ${flattened} @depth entries`);
 }
 
 // ── 向量召回挪到末尾 ─────────────────────────────────────────────
@@ -92,7 +131,13 @@ function msgText(m) {
 
 function onWorldInfoActivated(entries) {
     CHECK.wiPrev = CHECK.wiNow;   // 上一轮亮过、这一轮灭了的条目，也要认得出来
-    CHECK.wiNow = Array.isArray(entries) ? entries.map(e => ({ name: e.comment || (Array.isArray(e.key) ? e.key.join(',') : '') || `#${e.uid}`, text: String(e.content || '') })) : [];
+    CHECK.wiNow = Array.isArray(entries) ? entries.map(e => ({ id: entryId(e), name: e.comment || (Array.isArray(e.key) ? e.key.join(',') : '') || `#${e.uid}`, text: String(e.content || '') })) : [];
+    // 宏在激活时已经替换好了：跟上一轮比，真变了就记下来
+    for (const e of CHECK.wiNow) {
+        const before = LAST.get(e.id);
+        if (before !== undefined && before !== e.text) markVolatile(e.id, '这轮内容跟上轮不一样');
+        LAST.set(e.id, e.text);
+    }
 }
 
 // 在 text 的第 pos 个字附近，认一认这是谁的内容
@@ -107,7 +152,13 @@ function whoIsAt(text, pos) {
         }
         return false;
     };
-    for (const e of [...CHECK.wiNow, ...CHECK.wiPrev]) if (covers(e.text)) return `世界书「${e.name}」`;
+    for (const e of [...CHECK.wiNow, ...CHECK.wiPrev]) if (covers(e.text)) { CHECK.hitId = e.id; return `世界书「${e.name}」`; }
+    // <% %> 模板是发送前才渲染的，激活时的内容对不上，用模板里固定的文字片段去认
+    for (const [id, info] of ENTRY) {
+        if (!info.macro) continue;
+        const parts = info.raw.split(/<%[\s\S]*?%>|\{\{[\s\S]*?\}\}/).map(x => x.trim()).filter(x => x.length >= 12);
+        if (parts.some(covers)) { CHECK.hitId = id; return `世界书「${info.name}」`; }
+    }
     for (const key of VECTOR_KEYS) if (covers(String(extension_prompts[key]?.value || ''))) return '向量召回';
     const ctx = SillyTavern.getContext();
     const ch = ctx.characters?.[ctx.characterId];
@@ -145,8 +196,10 @@ function runCheckup(chat) {
     const tail = now.length - k;   // 变化点后面还剩几条
     let where = '';
     if (k < now.length) {
+        CHECK.hitId = null;
         const who = whoIsAt(now[k].text, pos) || (k < prev.length ? whoIsAt(prev[k].text, pos) : '');
-        where = `从第 ${k + 1} 条（共 ${now.length} 条）开始变` + (who ? `，是 ${who}` : '') + `：「${snippet(now[k].text, pos)}」`;
+        if (CHECK.hitId && tail > 3 && markVolatile(CHECK.hitId, '体检发现它在变')) where = '（已记下，下一轮起挪到末尾）';
+        where = `从第 ${k + 1} 条（共 ${now.length} 条）开始变` + (who ? `，是 ${who}` : '') + `：「${snippet(now[k].text, pos)}」` + where;
     }
     const ok = pct >= 70 || tail <= 3;   // 只在最后两三条变 = 正常的新对话
     showCheckup(`本轮前缀不变 ${pct}%` + (where ? `｜${where}` : ''), ok);
@@ -222,7 +275,9 @@ function addSettingsUi() {
         </div>
         <div class="inline-drawer-content">
           <label class="checkbox_label"><input id="cf_enabled" type="checkbox"> 会变的世界书条目挪到聊天末尾</label>
-          <small>绿灯条目、带 {{getvar}} / {{random}} / {{time}} / &lt;% %&gt; 的条目 → 深度 0。不会变的常驻条目不动。</small>
+          <small>绿灯条目一律挪到深度 0。带 {{getvar}} / &lt;% %&gt; 的常驻条目先留在原位，检测到前后两轮内容真的变了才挪。条目标题写 [cf:end] 强制挪、[cf:keep] 强制不挪。</small>
+          <label class="checkbox_label"><input id="cf_strict" type="checkbox"> 带变量的条目一律挪（旧版做法）</label>
+          <small>不等检测，带变量/模板的条目直接挪到末尾。缓存更稳，但一整局都不变的条目也会被挪走。</small>
           <label class="checkbox_label"><input id="cf_depth" type="checkbox"> 按深度插入的世界书也收到末尾</label>
           <small>@深度 N 的条目改成深度 0，不再插在聊天中间。</small>
           <label class="checkbox_label"><input id="cf_vec" type="checkbox"> 向量召回挪到聊天末尾</label>
@@ -242,6 +297,7 @@ function addSettingsUi() {
     </div>`;
     $('#extensions_settings2').append(html);
     $('#cf_enabled').prop('checked', s.enabled).on('input', function () { settings().enabled = !!$(this).prop('checked'); saveSettingsDebounced(); });
+    $('#cf_strict').prop('checked', s.strictMacro).on('input', function () { settings().strictMacro = !!$(this).prop('checked'); saveSettingsDebounced(); });
     $('#cf_depth').prop('checked', s.depthToEnd).on('input', function () { settings().depthToEnd = !!$(this).prop('checked'); saveSettingsDebounced(); });
     $('#cf_vec').prop('checked', s.vectorsToEnd).on('input', function () { settings().vectorsToEnd = !!$(this).prop('checked'); saveSettingsDebounced(); });
     $('#cf_claude').prop('checked', s.claudeCache).on('input', function () { settings().claudeCache = !!$(this).prop('checked'); saveSettingsDebounced(); });
@@ -257,4 +313,5 @@ jQuery(() => {
     eventSource.on(event_types.WORLDINFO_ENTRIES_LOADED, onEntriesLoaded);
     eventSource.on(event_types.CHAT_COMPLETION_PROMPT_READY, onPromptReady);
     eventSource.on(event_types.WORLD_INFO_ACTIVATED, onWorldInfoActivated);
+    eventSource.on(event_types.CHAT_CHANGED, () => LAST.clear());
 });
