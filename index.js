@@ -11,7 +11,7 @@ import { eventSource, event_types, saveSettingsDebounced, extension_prompts, ext
 import { extension_settings } from '../../../extensions.js';
 
 const KEY = 'cacheFriendly';
-const DEFAULTS = { enabled: true, strictMacro: false, depthToEnd: true, vectorsToEnd: true, claudeCache: true, cache1h: false, checkup: true, checkupToast: true, log: false };
+const DEFAULTS = { enabled: true, strictMacro: false, depthToEnd: true, vectorsToEnd: true, extToEnd: true, claudeCache: true, cache1h: false, checkup: true, checkupToast: true, log: false };
 
 // world_info_position: before 0, after 1, ANTop 2, ANBottom 3, atDepth 4, EMTop 5, EMBottom 6, outlet 7
 const STATIC_POSITIONS = [0, 1, 5, 6];
@@ -101,8 +101,58 @@ function onEntriesLoaded(lore) {
 // 把这两项改成"聊天内 · 深度 0"。只改这一轮要用的位置，不改向量插件的设置。
 const VECTOR_KEYS = ['3_vectors', '4_vectors_data_bank'];
 
+// ── 其他插件的注入：变了才挪（1.6.0）─────────────────────────────
+// 数据库/表格、总结、小白X、/inject……这些插件都往 extension_prompts 里塞东西，
+// 很多塞在聊天记录前面（IN_PROMPT / BEFORE_PROMPT）或者聊天中间（深度 > 0）。
+// 跟带变量的世界书一个办法：每轮记下每条注入的内容，看到前后两轮真的变了，
+// 才记成"会变的"，从下一轮起改到聊天末尾（深度 0）。不变的原地不动，不改那些插件的设置。
+// 酒馆自己的世界书深度条目、outlet、静默提示、故事串不归这里管。
+const EXT_SKIP = /^(customDepthWI|customWIOutlet|QUIET_PROMPT|__STORY_STRING__)/;
+const EXT_LAST = new Map();   // key -> 上一轮内容（只在内存里）
+
+function extVolatileSet() {
+    const meta = SillyTavern.getContext().chatMetadata;
+    if (!meta) return null;
+    if (!Array.isArray(meta.cacheFriendlyVolatileExt)) meta.cacheFriendlyVolatileExt = [];
+    return meta.cacheFriendlyVolatileExt;
+}
+
+function markExtVolatile(key, why) {
+    const list = extVolatileSet();
+    if (!list || list.includes(key)) return false;
+    list.push(key);
+    SillyTavern.getContext().saveMetadataDebounced?.();
+    if (settings().log) console.log(`[Cache Friendly] 插件注入「${key}」${why}，下一轮起挪到末尾`);
+    return true;
+}
+
+function extAtEnd(p) { return p.position === extension_prompt_types.IN_CHAT && Number(p.depth) === 0; }
+
+function moveVolatileExt() {
+    const list = extVolatileSet() || [];
+    let moved = 0;
+    for (const key of Object.keys(extension_prompts)) {
+        if (EXT_SKIP.test(key) || VECTOR_KEYS.includes(key)) continue;
+        const p = extension_prompts[key];
+        if (!p || !p.value || p.position === extension_prompt_types.NONE) continue;
+        const val = String(p.value);
+        const before = EXT_LAST.get(key);
+        EXT_LAST.set(key, val);
+        if (list.includes(key)) {
+            p.position = extension_prompt_types.IN_CHAT;
+            p.depth = 0;
+            moved++;
+            continue;
+        }
+        if (extAtEnd(p)) continue;
+        if (before !== undefined && before !== val) markExtVolatile(key, '这轮内容跟上轮不一样');
+    }
+    return moved;
+}
+
 globalThis.cacheFriendly_interceptor = async function () {
     const s = settings();
+    STAT.ext = s.extToEnd ? moveVolatileExt() : 0;
     if (!s.vectorsToEnd) return;
     let moved = 0;
     for (const key of VECTOR_KEYS) {
@@ -123,7 +173,7 @@ globalThis.cacheFriendly_interceptor = async function () {
 // 掉下来时指出从哪儿开始变的，尽量认出是哪条世界书 / 角色卡哪一栏 / 向量召回。
 // 只在本地比，不发任何请求；只看文字，不看缓存标记。
 const CHECK = { chatId: null, prev: null, wiNow: [], wiPrev: [], history: [] };
-const STAT = { moved: 0, flattened: 0, vectors: 0 };   // 最近一轮挪了多少，给测试报告用
+const STAT = { moved: 0, flattened: 0, vectors: 0, ext: 0 };   // 最近一轮挪了多少，给测试报告用
 
 function msgText(m) {
     if (!m) return '';
@@ -163,6 +213,12 @@ function whoIsAt(text, pos) {
         if (parts.some(covers)) { CHECK.hitId = id; return `世界书「${info.name}」`; }
     }
     for (const key of VECTOR_KEYS) if (covers(String(extension_prompts[key]?.value || ''))) return '向量召回';
+    for (const key of Object.keys(extension_prompts)) {
+        if (EXT_SKIP.test(key) || VECTOR_KEYS.includes(key)) continue;
+        const raw = String(extension_prompts[key]?.value || '');
+        const parts = [raw, ...raw.split(/\{\{[\s\S]*?\}\}/).map(x => x.trim()).filter(x => x.length >= 12)];
+        if (parts.some(covers)) { CHECK.extHit = key; return `插件注入「${key}」`; }
+    }
     const ctx = SillyTavern.getContext();
     const ch = ctx.characters?.[ctx.characterId];
     if (ch) {
@@ -199,20 +255,47 @@ function runCheckup(chat) {
     const tail = now.length - k;   // 变化点后面还剩几条
     let where = '';
     if (k < now.length) {
-        CHECK.hitId = null;
+        CHECK.hitId = null; CHECK.extHit = null;
         const who = whoIsAt(now[k].text, pos) || (k < prev.length ? whoIsAt(prev[k].text, pos) : '');
         CHECK.lastWho = who;
         if (CHECK.hitId && tail > 3 && markVolatile(CHECK.hitId, '体检发现它在变')) where = '（已记下，下一轮起挪到末尾）';
+        if (CHECK.extHit && tail > 3 && settings().extToEnd && markExtVolatile(CHECK.extHit, '体检发现它在变')) where = '（已记下，下一轮起挪到末尾）';
         where = `从第 ${k + 1} 条（共 ${now.length} 条）开始变` + (who ? `，是 ${who}` : '') + `：「${snippet(now[k].text, pos)}」` + where;
     }
     const ok = pct >= 70 || tail <= 3;   // 只在最后两三条变 = 正常的新对话
-    CHECK.history.push({ pct, at: k < now.length ? k + 1 : null, n: now.length, who: k < now.length ? (CHECK.lastWho || '') : '', ok });
+    let lead = 0;
+    while (lead < now.length && now[lead].role === 'system') lead++;
+    CHECK.history.push({ pct, at: k < now.length ? k + 1 : null, n: now.length, lead, who: k < now.length ? (CHECK.lastWho || '') : '', ok });
     if (CHECK.history.length > 10) CHECK.history.shift();
+    const dx = diagnose();
+    if (dx) where += `\n诊断：${dx}`;
     showCheckup(`本轮前缀不变 ${pct}%` + (where ? `｜${where}` : ''), ok);
     if (!ok && s.checkupToast && typeof toastr !== 'undefined') {
         toastr.warning(`前面只有 ${pct}% 没变，缓存大半作废。\n${where}`, '缓存体检', { timeOut: 8000 });
     }
     if (s.log) console.log('[Cache Friendly] checkup', pct, where);
+}
+
+// ── 诊断：从最近几轮的"在哪儿变"认出常见病因（1.6.0）──────────────────────
+// 1) 每轮都在"离结尾固定第 N 条"变 → 记忆/摘要插件每轮隐藏一层旧楼层
+// 2) 总条数不涨、从聊天第一条就变 → 上下文满了，酒馆每轮砍最老的消息
+// 3) 从第 1 条（最顶上）就变 → 有东西把会变的内容塞在了最前面
+function diagnose() {
+    const h = CHECK.history.filter(x => !x.ok && x.at);
+    const last = CHECK.history[CHECK.history.length - 1];
+    if (!last || last.ok || !last.at) return '';
+    if (last.who) return '';   // 已经认出是哪条了，不用猜
+    if (last.at === 1) return '从最顶上第 1 条就在变：有插件或预设把会变的内容放在了所有东西最前面（状态表、总结、骰子、时间之类）。找到它，改成插在聊天末尾 / 深度 0。';
+    const r = h.slice(-3);
+    if (r.length >= 3) {
+        const tails = r.map(x => x.n - x.at);
+        const grow = r[r.length - 1].n - r[0].n;
+        if (Math.max(...tails) - Math.min(...tails) <= 2 && grow >= 2)
+            return `每轮都在离结尾约 ${tails[tails.length - 1]} 条的地方变：多半是记忆 / 摘要插件在每轮自动隐藏旧楼层。这个修不了，建议把它设成"攒够一批再隐藏"。`;
+        if (Math.abs(grow) <= 1 && r.every(x => x.at <= x.lead + 2))
+            return '聊天条数不再增加、每轮从聊天记录开头就变：上下文满了，酒馆每轮在砍最老的消息。把上下文长度（Context Size）调大就好。';
+    }
+    return '';
 }
 
 // ── 测试报告 ─────────────────────────────────────────────────────
@@ -234,14 +317,16 @@ async function buildReport() {
         '【Cache Friendly 测试报告】',
         `插件 ${ver} ｜ 酒馆 ${st}`,
         `接口来源：${src} ｜ 模型：${model}`,
-        `开关：挪世界书 ${on(s.enabled)}｜带变量一律挪 ${on(s.strictMacro)}｜深度条目收尾 ${on(s.depthToEnd)}｜向量召回 ${on(s.vectorsToEnd)}｜自动Claude缓存 ${on(s.claudeCache)}｜1小时 ${on(s.cache1h)}`,
-        `最近一轮：挪了 ${STAT.moved} 条世界书，收尾 ${STAT.flattened} 条深度条目，向量召回 ${STAT.vectors ? '已挪' : '无/未挪'}`,
+        `开关：挪世界书 ${on(s.enabled)}｜带变量一律挪 ${on(s.strictMacro)}｜深度条目收尾 ${on(s.depthToEnd)}｜向量召回 ${on(s.vectorsToEnd)}｜插件注入 ${on(s.extToEnd)}｜自动Claude缓存 ${on(s.claudeCache)}｜1小时 ${on(s.cache1h)}`,
+        `最近一轮：挪了 ${STAT.moved} 条世界书，收尾 ${STAT.flattened} 条深度条目，向量召回 ${STAT.vectors ? '已挪' : '无/未挪'}，插件注入挪了 ${STAT.ext} 条`,
+        `检测到在变、已挪走的插件注入：${(extVolatileSet() || []).join('、') || '无'}`,
         `本聊天里检测到在变、已挪走的常驻条目：${vol.length ? vol.join('、') : '无'}`,
         `最近 ${CHECK.history.length} 轮体检（前缀不变%）：`,
         ...CHECK.history.map((h, i) => `  ${i + 1}. ${h.pct}%` + (h.at ? `，从第 ${h.at}/${h.n} 条开始变` : '') + (h.who ? `（${h.who}）` : '') + (h.ok ? '' : ' ⚠')),
+        ...(diagnose() ? [`诊断：${diagnose()}`] : []),
         '（请再附一张用量记录截图：缓存读取 / 写入，记得打码钥匙）',
     ];
-    if (!CHECK.history.length) lines.splice(7, 0, '  还没有数据：先聊两三轮再生成');
+    if (!CHECK.history.length) lines.splice(8, 0, '  还没有数据：先聊两三轮再生成');
     return lines.join('\n');
 }
 
@@ -329,6 +414,8 @@ function addSettingsUi() {
           <small>@深度 N 的条目改成深度 0，不再插在聊天中间。</small>
           <label class="checkbox_label"><input id="cf_vec" type="checkbox"> 向量召回挪到聊天末尾</label>
           <small>聊天记录向量化、资料库每轮捞出来的片段不一样，挪到最后就不打碎前面的缓存。</small>
+          <label class="checkbox_label"><input id="cf_ext" type="checkbox"> 其他插件的注入：变了就挪到末尾</label>
+          <small>数据库 / 表格、总结、小白X、/inject 等插件塞进来的内容，检测到前后两轮真的变了，就从下一轮起挪到聊天末尾。不变的不动。</small>
           <label class="checkbox_label"><input id="cf_claude" type="checkbox"> 自定义接口用 Claude 时自动开缓存</label>
           <small>"自定义（OpenAI 兼容）"连 Claude 模型时，自动打缓存标记（system + 聊天记录滚动缓存）。接口要认这个标记才生效；用"Claude"接口的请改 config.yaml。</small>
           <label class="checkbox_label"><input id="cf_1h" type="checkbox"> 用 1 小时缓存</label>
@@ -349,6 +436,7 @@ function addSettingsUi() {
     $('#cf_strict').prop('checked', s.strictMacro).on('input', function () { settings().strictMacro = !!$(this).prop('checked'); saveSettingsDebounced(); });
     $('#cf_depth').prop('checked', s.depthToEnd).on('input', function () { settings().depthToEnd = !!$(this).prop('checked'); saveSettingsDebounced(); });
     $('#cf_vec').prop('checked', s.vectorsToEnd).on('input', function () { settings().vectorsToEnd = !!$(this).prop('checked'); saveSettingsDebounced(); });
+    $('#cf_ext').prop('checked', s.extToEnd).on('input', function () { settings().extToEnd = !!$(this).prop('checked'); saveSettingsDebounced(); });
     $('#cf_claude').prop('checked', s.claudeCache).on('input', function () { settings().claudeCache = !!$(this).prop('checked'); saveSettingsDebounced(); });
     $('#cf_1h').prop('checked', s.cache1h).on('input', function () { settings().cache1h = !!$(this).prop('checked'); saveSettingsDebounced(); });
     $('#cf_check').prop('checked', s.checkup).on('input', function () { settings().checkup = !!$(this).prop('checked'); saveSettingsDebounced(); });
@@ -363,5 +451,5 @@ jQuery(() => {
     eventSource.on(event_types.WORLDINFO_ENTRIES_LOADED, onEntriesLoaded);
     eventSource.on(event_types.CHAT_COMPLETION_PROMPT_READY, onPromptReady);
     eventSource.on(event_types.WORLD_INFO_ACTIVATED, onWorldInfoActivated);
-    eventSource.on(event_types.CHAT_CHANGED, () => LAST.clear());
+    eventSource.on(event_types.CHAT_CHANGED, () => { LAST.clear(); EXT_LAST.clear(); });
 });
